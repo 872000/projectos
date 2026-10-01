@@ -1,0 +1,113 @@
+# Private development plan — not for public repo
+PLAN.md
+docs/adr/
+docs/feature-tree.yaml
+notes/
+.notes/
+TODO-private.md
+
+# Private tooling — share/screenshot scripts touch the real portfolio
+scripts/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+# .python-version IS committed — pins Python version for pyenv / uv
+
+# Testing and coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+
+# Type checkers
+.mypy_cache/
+.pytype/
+.pyre/
+.ruff_cache/
+
+# Lock files: committed for reproducible application installs
+# (uv.lock / poetry.lock NOT ignored on purpose)
+
+# Local workspace data (generated at runtime, per-user)
+*.db
+*.sqlite
+*.sqlite3
+cache/
+.cache/
+
+# Local workspace config (user-specific, runtime-generated)
+.config/
+config.local.yaml
+config.yaml
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Logs
+*.log
+logs/
+
+# Environment variables / secrets
+.env
+.env.local
+.env.*.local
+secrets.yaml
+secrets.json
+
+# Streamlit local state
+.streamlit/secrets.toml
+
+# Local Claude Code state — absolute paths, personal hooks, refresh counter
+.claude/settings.json
+.claude/settings.local.json
+.claude/revive-counter
+.claude/scheduled_tasks.lock
+
+# Local revive brief (cites private ADRs / PLAN.md per project's own
+# private-data rule — keep out of the public repo until scrubbed)
+.revive/

@@ -1,0 +1,436 @@
+"""Tests for `armillary.mcp_server` — MCP tool functions.
+
+Tests the pure logic: project context enrichment, hit-to-dict conversion,
+armillary_projects tool output, and response size safety guards.
+"""
+
+from __future__ import annotations
+
+import json
+from datetime import datetime
+from pathlib import Path
+
+import pytest
+
+from armillary.cache import Cache
+from armillary.mcp_server import (
+    _PREVIEW_MAX_LEN,
+    _RESPONSE_MAX_CHARS,
+    _clamp_max_results,
+    _hit_to_dict,
+    _project_context,
+    _safe_json,
+    armillary_context,
+    armillary_projects,
+    armillary_revive,
+    armillary_search,
+)
+from armillary.models import Project, ProjectMetadata, ProjectType, Status
+from armillary.revive_service import ReviveError
+from armillary.search import SearchHit
+
+_NOW = datetime(2026, 4, 12, 12, 0, 0)
+
+
+def _project(
+    name: str,
+    *,
+    metadata: ProjectMetadata | None = None,
+    path: Path | None = None,
+) -> Project:
+    base = path or Path(f"/tmp/{name}")
+    return Project(
+        path=base,
+        name=name,
+        type=ProjectType.GIT,
+        umbrella=base.parent,
+        last_modified=_NOW,
+        metadata=metadata,
+    )
+
+
+@pytest.fixture()
+def _use_tmp_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Route all Cache() calls to a temp DB via env var."""
+    db_path = tmp_path / "cache.db"
+    monkeypatch.setenv("ARMILLARY_CACHE_DB", str(db_path))
+    return db_path
+
+
+# --- _project_context ------------------------------------------------------
+
+
+def test_project_context_returns_nulls_for_missing_project(
+    _use_tmp_cache: Path,
+) -> None:
+    db_path = _use_tmp_cache
+    with Cache(db_path=db_path):
+        pass  # empty cache
+
+    result = _project_context("nonexistent")
+    assert result["path"] is None
+    assert result["status"] is None
+    assert result["description"] is None
+
+
+def test_project_context_returns_metadata_for_existing_project(
+    _use_tmp_cache: Path,
+) -> None:
+    db_path = _use_tmp_cache
+    md = ProjectMetadata(
+        status=Status.ACTIVE,
+        readme_excerpt="A quiz app.",
+    )
+    with Cache(db_path=db_path) as cache:
+        cache.upsert([_project("quiz", metadata=md)])
+
+    result = _project_context("quiz")
+    assert result["path"] == "/tmp/quiz"
+    assert result["status"] == "ACTIVE"
+    assert result["description"] == "A quiz app."
+
+
+# --- _hit_to_dict -----------------------------------------------------------
+
+
+def test_hit_to_dict_tags_project_name() -> None:
+    """Each hit carries only the project name; metadata lives in the
+    top-level ``projects`` map built by ``armillary_search``."""
+    hit = SearchHit(
+        path=Path("/tmp/foo/bar.py"), line=42, preview="def bar():", backend="ripgrep"
+    )
+
+    result = _hit_to_dict(hit, "foo")
+
+    assert result["project"] == "foo"
+    assert result["file"] == "/tmp/foo/bar.py"
+    assert result["line"] == 42
+    assert result["preview"] == "def bar():"
+    # Metadata intentionally absent per-hit — it would duplicate across
+    # every match from the same repo.
+    assert "path" not in result
+    assert "status" not in result
+    assert "description" not in result
+
+
+def test_hit_to_dict_truncates_long_preview() -> None:
+    long_preview = "x" * 300
+    hit = SearchHit(
+        path=Path("/tmp/foo/bar.py"),
+        line=1,
+        preview=long_preview,
+        backend="ripgrep",
+    )
+    result = _hit_to_dict(hit, "foo")
+    assert len(result["preview"]) == _PREVIEW_MAX_LEN + 1  # +1 for "…"
+    assert result["preview"].endswith("…")
+
+
+def test_hit_to_dict_keeps_short_preview() -> None:
+    meta = {"path": "/tmp/foo", "status": "ACTIVE", "description": None}
+    hit = SearchHit(
+        path=Path("/tmp/foo/bar.py"),
+        line=1,
+        preview="short",
+        backend="ripgrep",
+    )
+    result = _hit_to_dict(hit, meta)
+    assert result["preview"] == "short"
+
+
+# --- armillary_projects -----------------------------------------------------
+
+
+def test_armillary_projects_returns_all(_use_tmp_cache: Path) -> None:
+    db_path = _use_tmp_cache
+    with Cache(db_path=db_path) as cache:
+        cache.upsert(
+            [
+                _project(
+                    "alpha",
+                    metadata=ProjectMetadata(
+                        status=Status.ACTIVE, readme_excerpt="Alpha app"
+                    ),
+                ),
+                _project("beta", metadata=ProjectMetadata(status=Status.DORMANT)),
+            ]
+        )
+
+    result = json.loads(armillary_projects())
+    assert len(result) == 2
+    paths = {r["path"] for r in result}
+    assert "/tmp/alpha" in paths
+    assert "/tmp/beta" in paths
+    for row in result:
+        assert "path" in row
+        assert "status" in row
+        assert "description" in row
+
+
+def test_armillary_projects_filters_by_status(_use_tmp_cache: Path) -> None:
+    db_path = _use_tmp_cache
+    with Cache(db_path=db_path) as cache:
+        cache.upsert(
+            [
+                _project("active1", metadata=ProjectMetadata(status=Status.ACTIVE)),
+                _project("dormant1", metadata=ProjectMetadata(status=Status.DORMANT)),
+                _project("active2", metadata=ProjectMetadata(status=Status.ACTIVE)),
+            ]
+        )
+
+    result = json.loads(armillary_projects(status_filter="ACTIVE"))
+    assert len(result) == 2
+    assert all(r["status"] == "ACTIVE" for r in result)
+
+
+def test_armillary_projects_empty_cache(_use_tmp_cache: Path) -> None:
+    db_path = _use_tmp_cache
+    with Cache(db_path=db_path):
+        pass
+
+    result = json.loads(armillary_projects())
+    assert result == []
+
+
+# --- _safe_json truncation --------------------------------------------------
+
+
+def test_safe_json_returns_compact_json() -> None:
+    results = [{"a": 1}, {"a": 2}]
+    output = _safe_json(results, 2, 2)
+    assert " " not in output
+    parsed = json.loads(output)
+    assert len(parsed) == 2
+
+
+def test_safe_json_adds_truncated_marker_when_shown_less_than_total() -> None:
+    results = [{"a": 1}]
+    output = _safe_json(results, 5, 1)
+    parsed = json.loads(output)
+    assert len(parsed) == 2
+    assert parsed[-1]["_truncated"] == 4
+
+
+def test_safe_json_trims_results_when_over_char_limit() -> None:
+    big_results = [{"data": "x" * 500, "i": i} for i in range(200)]
+    output = _safe_json(big_results, 200, 200)
+    assert len(output) <= _RESPONSE_MAX_CHARS + 100
+    parsed = json.loads(output)
+    assert parsed[-1]["_truncated"] > 0
+
+
+def test_safe_json_no_marker_when_all_shown() -> None:
+    results = [{"a": 1}]
+    output = _safe_json(results, 1, 1)
+    parsed = json.loads(output)
+    assert len(parsed) == 1
+    assert "_truncated" not in parsed[0]
+
+
+def test_clamp_max_results_enforces_public_bounds() -> None:
+    assert _clamp_max_results(-5) == 1
+    assert _clamp_max_results(0) == 1
+    assert _clamp_max_results(1) == 1
+    assert _clamp_max_results(999) == 200
+
+
+def test_armillary_search_clamps_zero_max_results_before_backend_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[int] = []
+
+    class FakeLiteralSearch:
+        @staticmethod
+        def is_available() -> bool:
+            return True
+
+        def search(
+            self, query: str, *, root: Path, max_results: int = 50
+        ) -> list[SearchHit]:
+            calls.append(max_results)
+            return []
+
+    monkeypatch.setattr("armillary.mcp_tools.LiteralSearch", FakeLiteralSearch)
+    monkeypatch.setattr(
+        "armillary.mcp_tools._get_project_roots",
+        lambda: [("alpha", Path("/tmp/alpha"))],
+    )
+
+    result = armillary_search("needle", max_results=0)
+
+    assert calls == [1]
+    assert result == "No matches for 'needle' across 1 projects."
+
+
+def test_armillary_search_emits_project_meta_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Many hits in the same repo should not repeat the description."""
+    import json as _json
+
+    alpha_hits = [
+        SearchHit(path=Path("/tmp/alpha/a.py"), line=1, preview="x", backend="rg"),
+        SearchHit(path=Path("/tmp/alpha/b.py"), line=2, preview="y", backend="rg"),
+        SearchHit(path=Path("/tmp/alpha/c.py"), line=3, preview="z", backend="rg"),
+    ]
+
+    class FakeLiteralSearch:
+        @staticmethod
+        def is_available() -> bool:
+            return True
+
+        def search(
+            self, query: str, *, root: Path, max_results: int = 50
+        ) -> list[SearchHit]:
+            return alpha_hits if "alpha" in str(root) else []
+
+    monkeypatch.setattr("armillary.mcp_tools.LiteralSearch", FakeLiteralSearch)
+    monkeypatch.setattr(
+        "armillary.mcp_tools._get_project_roots",
+        lambda: [("alpha", Path("/tmp/alpha"))],
+    )
+    monkeypatch.setattr(
+        "armillary.mcp_tools._project_context",
+        lambda name: {
+            "path": "/tmp/alpha",
+            "status": "ACTIVE",
+            "description": "The Alpha project — does alpha things.",
+        },
+    )
+
+    result = armillary_search("needle", max_results=10)
+    payload = _json.loads(result)
+
+    # Exactly one projects-map entry, regardless of hit count
+    assert set(payload["projects"].keys()) == {"alpha"}
+    assert payload["projects"]["alpha"]["description"].startswith("The Alpha")
+    # All 3 hits carry only the project name, not the description
+    assert len(payload["hits"]) == 3
+    for h in payload["hits"]:
+        assert h["project"] == "alpha"
+        assert "description" not in h
+    # Description appears once in the serialized output, not 3×
+    assert result.count("The Alpha") == 1
+
+
+# --- armillary_context -------------------------------------------------------
+
+
+def test_armillary_context_returns_json_for_existing_project(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from armillary.context_service import ProjectContext
+
+    fake_ctx = ProjectContext(
+        name="quiz",
+        path=Path("/tmp/quiz"),
+        status="ACTIVE",
+        work_hours=10.0,
+        branch="main",
+        dirty_files=["M  app.py"],
+        dirty_count=1,
+        recent_commits=[],
+        recent_branches=[],
+        is_git=True,
+    )
+    monkeypatch.setattr(
+        "armillary.context_service.get_context",
+        lambda name, **kw: fake_ctx,
+    )
+
+    result = armillary_context("quiz")
+
+    parsed = json.loads(result)
+    assert parsed["name"] == "quiz"
+    assert parsed["path"] == "/tmp/quiz"
+    assert parsed["status"] == "ACTIVE"
+    assert parsed["branch"] == "main"
+    assert parsed["dirty_count"] == 1
+    assert parsed["is_git"] is True
+
+
+def test_armillary_context_returns_error_for_not_found(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "armillary.context_service.get_context",
+        lambda name, **kw: None,
+    )
+
+    result = armillary_context("nonexistent")
+
+    assert "No project" in result
+    assert "nonexistent" in result
+
+
+def test_armillary_context_returns_error_for_ambiguous(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _raise(name: str, **kw: object) -> None:
+        raise ValueError("Ambiguous: alpha-one, alpha-two")
+
+    monkeypatch.setattr("armillary.context_service.get_context", _raise)
+
+    result = armillary_context("alpha")
+
+    assert "Ambiguous" in result
+
+
+# --- armillary_revive ------------------------------------------------------
+
+
+def test_armillary_revive_returns_helper_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "armillary.mcp_tools.generate_enhanced_brief",
+        lambda path: f"BRIEF for {path}",
+    )
+
+    result = armillary_revive("/repos/foo")
+
+    assert result == "BRIEF for /repos/foo"
+
+
+def test_armillary_revive_returns_string_on_revive_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _raise(_path: Path) -> str:
+        raise ReviveError("revive binary not found on PATH")
+
+    monkeypatch.setattr("armillary.mcp_tools.generate_enhanced_brief", _raise)
+
+    result = armillary_revive("/repos/foo")
+
+    assert result.startswith("revive failed:")
+    assert "not found" in result
+
+
+def test_armillary_revive_returns_string_on_unexpected_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _raise(_path: Path) -> str:
+        raise ValueError("totally unexpected")
+
+    monkeypatch.setattr("armillary.mcp_tools.generate_enhanced_brief", _raise)
+
+    result = armillary_revive("/repos/foo")
+
+    assert result.startswith("armillary_revive failed:")
+    assert "unexpected" in result
+
+
+def test_armillary_revive_clamps_to_response_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Match the safety budget the other MCP tools enforce."""
+    huge = "x" * (_RESPONSE_MAX_CHARS + 5_000)
+    monkeypatch.setattr(
+        "armillary.mcp_tools.generate_enhanced_brief",
+        lambda _path: huge,
+    )
+
+    result = armillary_revive("/repos/foo")
+
+    assert len(result) <= _RESPONSE_MAX_CHARS
+    assert result.endswith("[truncated to fit response budget]")
