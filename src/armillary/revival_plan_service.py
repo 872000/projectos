@@ -47,7 +47,29 @@ def plan(project_name: str,
          autopsy: AutopsyReport | None = None,
          completion: CompletionEstimate | None = None,
          todo: TodoAnalysis | None = None) -> RevivalPlan:
-    """Build an ordered revival plan from the three analyses."""
+    """Build an ordered revival plan from the three analyses.
+
+    The plan always opens with a re-entry brief, getting the project
+    running, and a done-definition; analysis findings insert targeted
+    steps in between (working-tree triage and branch pruning only when
+    the autopsy flags them, TODO burn-down only when markers exist, and
+    test/CI gap steps only when completion analysis reports them). It
+    closes with a smallest-valuable-slice step (only when the project is
+    under 70% complete) and a final revive-or-archive decision.
+
+    Args:
+        project_name: Name used in the plan header.
+        autopsy: Optional autopsy report; its findings gate the
+            triage and branch-pruning steps.
+        completion: Optional completion estimate; its work items gate
+            the test/CI gap steps and the percent-complete gates the
+            ship-a-slice step.
+        todo: Optional TODO analysis; its open-marker count sizes the
+            burn-down step.
+
+    Returns:
+        A RevivalPlan with sequentially ordered steps and hour estimates.
+    """
     steps: list[RevivalStep] = []
     n = 0
 
