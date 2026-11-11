@@ -6,7 +6,11 @@ from datetime import datetime
 from pathlib import Path
 
 from armillary.models import Project, ProjectType
-from armillary.utils import load_json_str_list, summarize_project_matches
+from armillary.utils import (
+    excerpt_one_liner,
+    load_json_str_list,
+    summarize_project_matches,
+)
 
 
 def test_load_json_str_list_filters_non_strings(tmp_path: Path) -> None:
@@ -71,3 +75,24 @@ def test_summarize_project_matches_truncates_to_limit() -> None:
 
 def test_summarize_project_matches_empty_returns_empty_string() -> None:
     assert summarize_project_matches([]) == ""
+
+
+def test_excerpt_one_liner_empty_returns_empty_string() -> None:
+    assert excerpt_one_liner("") == ""
+
+
+def test_excerpt_one_liner_returns_first_sentence() -> None:
+    assert excerpt_one_liner("Built in a weekend. Then abandoned for a year.") == (
+        "Built in a weekend."
+    )
+
+
+def test_excerpt_one_liner_truncates_without_sentence_boundary() -> None:
+    text = "word " * 30
+    assert excerpt_one_liner(text) == text[:80]
+    assert len(excerpt_one_liner(text)) == 80
+
+
+def test_excerpt_one_liner_truncates_when_sentence_beyond_limit() -> None:
+    text = "A very long opening sentence that keeps going and going. Short tail."
+    assert excerpt_one_liner(text, max_chars=20) == text[:20]
